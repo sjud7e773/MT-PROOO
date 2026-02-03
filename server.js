@@ -20,6 +20,7 @@ import crypto from 'crypto';
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+app.disable('x-powered-by');
 
 // ==================== CONFIGURATION ====================
 const API_ID = parseInt(process.env.TELEGRAM_API_ID || '0');
@@ -69,6 +70,108 @@ function log(level, message, data = {}) {
   const timestamp = new Date().toISOString();
   const logEntry = { timestamp, level, message, ...data };
   console.log(JSON.stringify(logEntry));
+}
+
+function safeBigInt(value) {
+  try {
+    if (value === undefined || value === null || value === '') return null;
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+}
+
+function getEntityId(entity) {
+  return entity?.id?.value ? BigInt(entity.id.value) : BigInt(entity.id);
+}
+
+function getEntityAccessHash(entity) {
+  const ah = entity?.accessHash?.value ? entity.accessHash.value : entity?.accessHash;
+  return safeBigInt(ah);
+}
+
+function peerFromEntity(entity) {
+  if (!entity) return null;
+  if (entity.className === 'Channel' || entity.megagroup === true || entity.broadcast === true) {
+    const channelId = getEntityId(entity);
+    const accessHash = getEntityAccessHash(entity);
+    if (!accessHash) return null;
+    return new Api.InputPeerChannel({ channelId, accessHash });
+  }
+  if (entity.className === 'Chat') {
+    const chatId = getEntityId(entity);
+    return new Api.InputPeerChat({ chatId });
+  }
+  return null;
+}
+
+async function resolvePeer(client, chatId, accessHash) {
+  // 1) Fast path: access_hash provided (Channel/Supergroup)
+  const chId = safeBigInt(chatId);
+  const ah = safeBigInt(accessHash);
+  if (chId && ah) {
+    return new Api.InputPeerChannel({ channelId: chId, accessHash: ah });
+  }
+
+  // 2) Robust path: resolve entity from Telegram (works even when DB access_hash is missing/wrong)
+  try {
+    const entity = await client.getEntity(chatId);
+    const peer = peerFromEntity(entity);
+    if (peer) return peer;
+  } catch {
+    // ignore
+  }
+
+  // 3) Try -100 prefix (common for channels/supergroups when users paste Bot API IDs)
+  try {
+    if (!String(chatId).startsWith('-100')) {
+      const prefixed = Number(`-100${Math.abs(Number(chatId))}`);
+      const entity = await client.getEntity(prefixed);
+      const peer = peerFromEntity(entity);
+      if (peer) return peer;
+    }
+  } catch {
+    // ignore
+  }
+
+  throw new Error('CHAT_NOT_FOUND');
+}
+
+function serializeMessage(m) {
+  const text = typeof m?.message === 'string' ? m.message : '';
+  const hasMedia = !!m?.media;
+
+  let mimeType = null;
+  let isPhoto = false;
+  let isVideo = false;
+
+  if (hasMedia) {
+    const mediaClass = m.media?.className;
+    if (mediaClass === 'MessageMediaPhoto') {
+      isPhoto = true;
+    }
+    if (mediaClass === 'MessageMediaDocument') {
+      mimeType = m.media?.document?.mimeType || null;
+      if (mimeType && typeof mimeType === 'string') {
+        if (mimeType.startsWith('video/')) isVideo = true;
+        if (mimeType.startsWith('image/')) isPhoto = true;
+      }
+    }
+  }
+
+  return {
+    id: m.id,
+    date: m.date,
+    message: text,
+    // Compatibility fields for edge functions (clone/forward processors):
+    media: hasMedia ? { className: m.media?.className || 'Media' } : null,
+    has_media: hasMedia,
+    photo: isPhoto,
+    video: isVideo,
+    document: mimeType ? { mime_type: mimeType } : null,
+    mime_type: mimeType,
+    from_id: m.fromId?.userId?.value ? Number(m.fromId.userId.value) : null,
+  };
 }
 
 // Middleware para verificar secret
@@ -495,7 +598,7 @@ app.post('/get-chat-info', verifySecret, async (req, res) => {
 // ==================== GET HISTORY ====================
 app.post('/get-history', verifySecret, async (req, res) => {
   try {
-    const { session_string, chat_id, access_hash, limit = 100, offset_id = 0, user_id, phone_number, media_filter } = req.body;
+    const { session_string, chat_id, access_hash, limit = 100, offset_id = 0, min_id, user_id, phone_number, media_filter } = req.body;
     
     if (!session_string || !chat_id) {
       return res.status(400).json({ error: 'session_string and chat_id are required', success: false });
@@ -511,23 +614,19 @@ app.post('/get-history', verifySecret, async (req, res) => {
     const identifier = `${user_id}_${phone_number}`;
     const client = await getOrCreateClient(decryptedSession, identifier);
 
-    // Build peer
-    let peer;
-    if (access_hash) {
-      peer = new Api.InputPeerChannel({
-        channelId: BigInt(chat_id),
-        accessHash: BigInt(access_hash),
-      });
-    } else {
-      peer = new Api.InputPeerChat({ chatId: BigInt(Math.abs(chat_id)) });
-    }
-
+    const peer = await resolvePeer(client, chat_id, access_hash);
     const messages = await client.getMessages(peer, { limit: Math.min(limit, 100), offsetId: offset_id });
 
+    // Optional server-side min_id filter (performance)
+    const minIdNum = typeof min_id === 'number' ? min_id : (min_id ? Number(min_id) : null);
+    const messagesAfterMin = minIdNum != null
+      ? messages.filter((m) => (m?.id || 0) > minIdNum)
+      : messages;
+
     // Filtrar por tipo de mídia se especificado
-    let filteredMessages = messages;
+    let filteredMessages = messagesAfterMin;
     if (media_filter) {
-      filteredMessages = messages.filter(m => {
+      filteredMessages = messagesAfterMin.filter(m => {
         if (!m.media) return false;
         
         const mediaClass = m.media.className;
@@ -553,21 +652,53 @@ app.post('/get-history', verifySecret, async (req, res) => {
 
     res.json({
       success: true,
-      messages: filteredMessages.map(m => ({
-        id: m.id,
-        date: m.date,
-        message: m.message,
-        from_id: m.fromId?.userId?.value ? Number(m.fromId.userId.value) : null,
-        has_media: !!m.media,
-        media_type: m.media?.className || null,
-        mime_type: m.media?.document?.mimeType || null,
-      })),
-      total_fetched: messages.length,
+      messages: filteredMessages.map(serializeMessage),
+      total_fetched: messagesAfterMin.length,
       filtered_count: filteredMessages.length,
       has_more: messages.length === Math.min(limit, 100),
     });
   } catch (error) {
     log('error', 'getHistory failed', { error: error.message });
+    serverStats.failedRequests++;
+    serverStats.lastError = { message: error.message, timestamp: new Date().toISOString() };
+    res.status(500).json({ error: error.message, success: false });
+  }
+});
+
+// ==================== GET MESSAGES (by ids) ====================
+// Needed by clone-processor for accurate media/text filtering.
+app.post('/get-messages', verifySecret, async (req, res) => {
+  try {
+    const { session_string, chat_id, access_hash, message_ids, user_id, phone_number } = req.body;
+
+    if (!session_string || chat_id === undefined || !Array.isArray(message_ids) || message_ids.length === 0) {
+      return res.status(400).json({ error: 'session_string, chat_id and message_ids are required', success: false });
+    }
+
+    const decryptedSession = decrypt(session_string, SERVER_SECRET);
+    if (!decryptedSession) {
+      return res.status(400).json({ error: 'Invalid session', success: false });
+    }
+
+    log('info', 'Fetching messages by ids', { chat_id, count: message_ids.length });
+
+    const identifier = `${user_id}_${phone_number}`;
+    const client = await getOrCreateClient(decryptedSession, identifier);
+    const peer = await resolvePeer(client, chat_id, access_hash);
+
+    const ids = message_ids.map((id) => Number(id)).filter((n) => Number.isFinite(n));
+    const messages = await client.getMessages(peer, { ids });
+
+    serverStats.successfulRequests++;
+    serverStats.lastSuccessfulRequest = new Date().toISOString();
+
+    res.json({
+      success: true,
+      messages: (messages || []).map(serializeMessage),
+      total: (messages || []).length,
+    });
+  } catch (error) {
+    log('error', 'getMessages failed', { error: error.message });
     serverStats.failedRequests++;
     serverStats.lastError = { message: error.message, timestamp: new Date().toISOString() };
     res.status(500).json({ error: error.message, success: false });
@@ -607,14 +738,9 @@ app.post('/forward-messages', verifySecret, async (req, res) => {
     const identifier = `${user_id}_${phone_number}`;
     const client = await getOrCreateClient(decryptedSession, identifier);
 
-    // Build peers
-    const fromPeer = from_access_hash 
-      ? new Api.InputPeerChannel({ channelId: BigInt(from_chat_id), accessHash: BigInt(from_access_hash) })
-      : new Api.InputPeerChat({ chatId: BigInt(Math.abs(from_chat_id)) });
-
-    const toPeer = to_access_hash
-      ? new Api.InputPeerChannel({ channelId: BigInt(to_chat_id), accessHash: BigInt(to_access_hash) })
-      : new Api.InputPeerChat({ chatId: BigInt(Math.abs(to_chat_id)) });
+    // Resolve peers robustly (works even if access_hash is missing/wrong)
+    const fromPeer = await resolvePeer(client, from_chat_id, from_access_hash);
+    const toPeer = await resolvePeer(client, to_chat_id, to_access_hash);
 
     const result = await client.invoke(
       new Api.messages.ForwardMessages({
@@ -626,13 +752,26 @@ app.post('/forward-messages', verifySecret, async (req, res) => {
       })
     );
 
+    // Extract forwarded message IDs from updates (so edge-functions can verify delivery)
+    const forwardedIds = [];
+    try {
+      const updatesArr = Array.isArray(result?.updates) ? result.updates : [];
+      for (const u of updatesArr) {
+        const msg = u?.message;
+        if (msg?.id) forwardedIds.push(msg.id);
+      }
+    } catch {
+      // ignore
+    }
+
     serverStats.successfulRequests++;
     serverStats.lastSuccessfulRequest = new Date().toISOString();
 
     res.json({
       success: true,
       forwarded: message_ids.length,
-      updates: result,
+      forwarded_ids: forwardedIds,
+      updates_count: Array.isArray(result?.updates) ? result.updates.length : null,
     });
   } catch (error) {
     log('error', 'forwardMessages failed', { error: error.message });
@@ -640,6 +779,19 @@ app.post('/forward-messages', verifySecret, async (req, res) => {
     serverStats.lastError = { message: error.message, timestamp: new Date().toISOString() };
     res.status(500).json({ error: error.message, success: false });
   }
+});
+
+// Always return JSON for unknown routes (prevents HTML 404 pages breaking edge parsing)
+app.use((req, res) => {
+  res.status(404).json({ success: false, error: 'Not found' });
+});
+
+// Global error handler (prevents HTML error pages)
+app.use((err, req, res, next) => {
+  log('error', 'Unhandled server error', { error: err?.message || String(err) });
+  serverStats.failedRequests++;
+  serverStats.lastError = { message: err?.message || String(err), timestamp: new Date().toISOString() };
+  res.status(500).json({ success: false, error: err?.message || 'Internal error' });
 });
 
 // ==================== SEND MEDIA (Clone sem forward tag) ====================
@@ -709,6 +861,92 @@ app.post('/send-media', verifySecret, async (req, res) => {
     });
   } catch (error) {
     log('error', 'sendMedia failed', { error: error.message });
+    serverStats.failedRequests++;
+    serverStats.lastError = { message: error.message, timestamp: new Date().toISOString() };
+    res.status(500).json({ error: error.message, success: false });
+  }
+});
+
+// ==================== GET CHAT PHOTO (REAL) ====================
+app.post('/get-chat-photo', verifySecret, async (req, res) => {
+  try {
+    const { session_string, chat_id, access_hash, user_id, phone_number } = req.body;
+    
+    if (!session_string || chat_id === undefined) {
+      return res.status(400).json({ error: 'session_string and chat_id are required', success: false });
+    }
+
+    const decryptedSession = decrypt(session_string, SERVER_SECRET);
+    if (!decryptedSession) {
+      return res.status(400).json({ error: 'Invalid session', success: false });
+    }
+
+    log('info', 'Fetching chat photo', { chat_id });
+
+    const identifier = `${user_id}_${phone_number}`;
+    const client = await getOrCreateClient(decryptedSession, identifier);
+
+    // Get the entity
+    let entity;
+    try {
+      if (access_hash) {
+        entity = await client.getEntity(new Api.InputPeerChannel({
+          channelId: BigInt(chat_id),
+          accessHash: BigInt(access_hash),
+        }));
+      } else {
+        entity = await client.getEntity(chat_id);
+      }
+    } catch (e) {
+      // Try with -100 prefix
+      if (!String(chat_id).startsWith('-100')) {
+        try {
+          entity = await client.getEntity(Number(`-100${Math.abs(chat_id)}`));
+        } catch {
+          return res.json({ success: true, photo_base64: null, has_photo: false });
+        }
+      } else {
+        return res.json({ success: true, photo_base64: null, has_photo: false });
+      }
+    }
+
+    // Check if entity has a photo
+    if (!entity.photo || entity.photo.className === 'ChatPhotoEmpty') {
+      log('info', 'Chat has no photo', { chat_id });
+      return res.json({ success: true, photo_base64: null, has_photo: false });
+    }
+
+    // Download the photo
+    try {
+      const photo = await client.downloadProfilePhoto(entity, {
+        isBig: false, // Use smaller version for performance
+      });
+
+      if (!photo || photo.length === 0) {
+        return res.json({ success: true, photo_base64: null, has_photo: false });
+      }
+
+      // Convert to base64
+      const base64 = Buffer.from(photo).toString('base64');
+      
+      log('info', 'Chat photo downloaded', { chat_id, size: photo.length });
+
+      serverStats.successfulRequests++;
+      serverStats.lastSuccessfulRequest = new Date().toISOString();
+
+      res.json({
+        success: true,
+        photo_base64: base64,
+        has_photo: true,
+        size: photo.length,
+        mime_type: 'image/jpeg',
+      });
+    } catch (downloadError) {
+      log('warn', 'Failed to download photo', { chat_id, error: downloadError.message });
+      return res.json({ success: true, photo_base64: null, has_photo: false });
+    }
+  } catch (error) {
+    log('error', 'getChatPhoto failed', { error: error.message });
     serverStats.failedRequests++;
     serverStats.lastError = { message: error.message, timestamp: new Date().toISOString() };
     res.status(500).json({ error: error.message, success: false });
