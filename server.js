@@ -1,5 +1,5 @@
 /**
- * MTProto Server v2.0 - Servidor ROBUSTO para Telegram
+ * MTProto Server v2.2 - Servidor ROBUSTO para Telegram
  * 
  * Melhorias:
  * - Reconexão automática
@@ -7,6 +7,9 @@
  * - Melhor tratamento de erros
  * - Pool de conexões
  * - Logs detalhados
+ * - BigInt-safe serialization + canonicalização (v2.2)
+ * - Version stamping nas respostas (v2.2)
+ * - FIX: ordem correta dos middlewares (404/error handler) (v2.2)
  * 
  * Deploy em: Railway, Render, Fly.io, ou VPS
  */
@@ -27,6 +30,10 @@ const API_ID = parseInt(process.env.TELEGRAM_API_ID || '0');
 const API_HASH = process.env.TELEGRAM_API_HASH || '';
 const SERVER_SECRET = process.env.MTPROTO_SERVER_SECRET || 'change-me-in-production';
 const PORT = process.env.PORT || 3000;
+
+// ==================== VERSIONING ====================
+const VERSION = '2.2.0';
+const DEPLOYED_AT = new Date().toISOString();
 
 // ==================== STATE MANAGEMENT ====================
 const pendingLogins = new Map();
@@ -72,22 +79,85 @@ function log(level, message, data = {}) {
   console.log(JSON.stringify(logEntry));
 }
 
+/**
+ * BIGINT-SAFE: Converts any value to BigInt without precision loss.
+ * Accepts: BigInt, number (safe integers only), string.
+ */
 function safeBigInt(value) {
-  try {
-    if (value === undefined || value === null || value === '') return null;
-    return BigInt(value);
-  } catch {
-    return null;
+  if (value === undefined || value === null || value === '') return null;
+  // Already BigInt
+  if (typeof value === 'bigint') return value;
+  // gramjs sometimes wraps BigInt in an object with .value
+  if (typeof value === 'object' && value !== null && 'value' in value) {
+    return safeBigInt(value.value);
   }
+  // Number - only if safe integer
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null;
+    // If not a safe integer, it's already corrupted; try to recover from string
+    if (!Number.isSafeInteger(value)) {
+      log('warn', 'Received unsafe number, precision may be lost', { value });
+    }
+    return BigInt(Math.trunc(value));
+  }
+  // String - parse directly
+  const s = String(value).trim();
+  if (!s) return null;
+  // Clean up any non-digit except leading minus
+  const cleaned = s.replace(/[^0-9-]/g, '');
+  if (/^-?\d+$/.test(cleaned)) {
+    try {
+      return BigInt(cleaned);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
+/**
+ * BIGINT-SAFE: Converts a BigInt or value to string for JSON serialization.
+ * Never uses Number() which loses precision.
+ */
+function bigIntToString(value) {
+  const bi = safeBigInt(value);
+  return bi !== null ? bi.toString() : null;
+}
+
+/**
+ * Normalize channel/chat IDs coming from mixed sources.
+ * - "-100..." (Bot API full id) -> "..." (channelId)
+ * - "-..." -> abs(...)
+ */
+function normalizePositiveId(value) {
+  const s = String(value ?? '').trim();
+  if (!s) return null;
+  if (s.startsWith('-100')) return safeBigInt(s.slice(4));
+  if (s.startsWith('-')) return safeBigInt(s.slice(1));
+  return safeBigInt(s);
+}
+
+/**
+ * Extract entity ID as BigInt, handling gramjs internal structures.
+ */
 function getEntityId(entity) {
-  return entity?.id?.value ? BigInt(entity.id.value) : BigInt(entity.id);
+  if (!entity) return null;
+  // gramjs wraps ids in objects with .value
+  if (entity.id?.value !== undefined) {
+    return safeBigInt(entity.id.value);
+  }
+  return safeBigInt(entity.id);
 }
 
+/**
+ * Extract entity accessHash as BigInt.
+ */
 function getEntityAccessHash(entity) {
-  const ah = entity?.accessHash?.value ? entity.accessHash.value : entity?.accessHash;
-  return safeBigInt(ah);
+  if (!entity) return null;
+  if (entity.accessHash?.value !== undefined) {
+    return safeBigInt(entity.accessHash.value);
+  }
+  return safeBigInt(entity.accessHash);
 }
 
 function peerFromEntity(entity) {
@@ -95,43 +165,123 @@ function peerFromEntity(entity) {
   if (entity.className === 'Channel' || entity.megagroup === true || entity.broadcast === true) {
     const channelId = getEntityId(entity);
     const accessHash = getEntityAccessHash(entity);
-    if (!accessHash) return null;
+    if (!channelId || !accessHash) return null;
     return new Api.InputPeerChannel({ channelId, accessHash });
   }
   if (entity.className === 'Chat') {
     const chatId = getEntityId(entity);
+    if (!chatId) return null;
     return new Api.InputPeerChat({ chatId });
   }
   return null;
 }
 
 async function resolvePeer(client, chatId, accessHash) {
-  // 1) Fast path: access_hash provided (Channel/Supergroup)
+  const chIdStr = String(chatId).trim();
   const chId = safeBigInt(chatId);
   const ah = safeBigInt(accessHash);
+  
+  log('debug', 'resolvePeer called', { 
+    chatId: chIdStr, 
+    accessHash: ah ? ah.toString() : null,
+    hasAccessHash: !!ah
+  });
+
+  // 1) Fast path: access_hash provided (Channel/Supergroup)
   if (chId && ah) {
-    return new Api.InputPeerChannel({ channelId: chId, accessHash: ah });
+    const channelId = normalizePositiveId(chIdStr) || (chId < 0n ? -chId : chId);
+    log('debug', 'Using fast path with access_hash', { channelId: channelId.toString(), accessHash: ah.toString() });
+    return new Api.InputPeerChannel({ channelId, accessHash: ah });
   }
 
-  // 2) Robust path: resolve entity from Telegram (works even when DB access_hash is missing/wrong)
+  // 2) Try InputPeerChat for basic groups (no access_hash needed)
+  if (chId && !ah) {
+    try {
+      const chatIdPos = chId < 0n ? -chId : chId;
+      const peer = new Api.InputPeerChat({ chatId: chatIdPos });
+      // Validate by trying to get entity info
+      await client.invoke(new Api.messages.GetHistory({
+        peer,
+        offsetId: 0,
+        offsetDate: 0,
+        addOffset: 0,
+        limit: 1,
+        maxId: 0,
+        minId: 0,
+        hash: BigInt(0),
+      }));
+      log('debug', 'InputPeerChat worked');
+      return peer;
+    } catch (err) {
+      log('debug', 'InputPeerChat failed, trying other methods', { error: err.message });
+    }
+  }
+
+  // 3) Robust path: resolve entity from Telegram dialogs
   try {
+    log('debug', 'Trying getEntity with raw chatId');
     const entity = await client.getEntity(chatId);
     const peer = peerFromEntity(entity);
-    if (peer) return peer;
-  } catch {
-    // ignore
+    if (peer) {
+      log('debug', 'getEntity succeeded');
+      return peer;
+    }
+  } catch (err) {
+    log('debug', 'getEntity with raw chatId failed', { error: err.message });
   }
 
-  // 3) Try -100 prefix (common for channels/supergroups when users paste Bot API IDs)
-  try {
-    if (!String(chatId).startsWith('-100')) {
-      const prefixed = Number(`-100${Math.abs(Number(chatId))}`);
-      const entity = await client.getEntity(prefixed);
+  // 4) Try with BigInt version
+  if (chId) {
+    try {
+      log('debug', 'Trying getEntity with BigInt chatId');
+      const entity = await client.getEntity(chId);
       const peer = peerFromEntity(entity);
-      if (peer) return peer;
+      if (peer) {
+        log('debug', 'getEntity with BigInt succeeded');
+        return peer;
+      }
+    } catch (err) {
+      log('debug', 'getEntity with BigInt failed', { error: err.message });
     }
-  } catch {
-    // ignore
+  }
+
+  // 5) Try -100 prefix (common for channels/supergroups when users paste Bot API IDs)
+  if (!chIdStr.startsWith('-100') && !chIdStr.startsWith('-')) {
+    try {
+      const prefixedStr = `-100${chIdStr}`;
+      log('debug', 'Trying getEntity with -100 prefix', { prefixedId: prefixedStr });
+      const prefixed = safeBigInt(prefixedStr);
+      if (prefixed) {
+        const entity = await client.getEntity(prefixed);
+        const peer = peerFromEntity(entity);
+        if (peer) {
+          log('debug', '-100 prefix worked');
+          return peer;
+        }
+      }
+    } catch (err) {
+      log('debug', 'getEntity with -100 prefix failed', { error: err.message });
+    }
+  }
+
+  // 6) Try refreshing dialogs and searching
+  try {
+    log('debug', 'Refreshing dialogs to find chat');
+    const dialogs = await client.getDialogs({ limit: 500 });
+    for (const d of dialogs) {
+      if (d.entity?.id) {
+        const entityId = getEntityId(d.entity);
+        if (entityId === chId || (chId && entityId === safeBigInt(`-100${chId}`))) {
+          const peer = peerFromEntity(d.entity);
+          if (peer) {
+            log('debug', 'Found chat in dialogs');
+            return peer;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    log('debug', 'Dialog search failed', { error: err.message });
   }
 
   throw new Error('CHAT_NOT_FOUND');
@@ -140,7 +290,6 @@ async function resolvePeer(client, chatId, accessHash) {
 function serializeMessage(m) {
   const text = typeof m?.message === 'string' ? m.message : '';
   const hasMedia = !!m?.media;
-
   let mimeType = null;
   let isPhoto = false;
   let isVideo = false;
@@ -216,7 +365,8 @@ app.get('/health', (req, res) => {
   
   res.json({ 
     status: 'ok',
-    version: '2.0.0',
+    version: VERSION,
+    deployed_at: DEPLOYED_AT,
     uptime_seconds: uptime,
     api_configured: !!(API_ID && API_HASH),
     secret_configured: SERVER_SECRET !== 'change-me-in-production',
@@ -286,7 +436,6 @@ app.post('/send-code', verifySecret, async (req, res) => {
     if (!phone_number) {
       return res.status(400).json({ error: 'phone_number is required', success: false });
     }
-
     if (!API_ID || !API_HASH) {
       return res.status(500).json({ error: 'API credentials not configured', success: false });
     }
@@ -487,11 +636,13 @@ app.post('/get-dialogs', verifySecret, async (req, res) => {
         if (entity.broadcast) chatType = 'channel';
         else if (entity.megagroup) chatType = 'supergroup';
 
+        // BIGINT-SAFE: Use bigIntToString to preserve precision
+        const chatId = bigIntToString(getEntityId(entity));
+        const accessHash = bigIntToString(getEntityAccessHash(entity));
+
         return {
-          chat_id: entity.id?.value ? Number(entity.id.value) : Number(entity.id),
-          access_hash: entity.accessHash?.value 
-            ? entity.accessHash.value.toString() 
-            : (entity.accessHash ? entity.accessHash.toString() : null),
+          chat_id: chatId,
+          access_hash: accessHash,
           title: entity.title || 'Sem título',
           username: entity.username || null,
           type: chatType,
@@ -512,6 +663,8 @@ app.post('/get-dialogs', verifySecret, async (req, res) => {
       total: chats.length,
       groups: chats.filter(c => c.type !== 'channel').length,
       channels: chats.filter(c => c.type === 'channel').length,
+      _version: VERSION,
+      _deployed_at: DEPLOYED_AT,
     });
   } catch (error) {
     log('error', 'getDialogs failed', { error: error.message });
@@ -547,13 +700,17 @@ app.post('/get-chat-info', verifySecret, async (req, res) => {
 
     // Buscar entidade pelo ID
     let entity;
+    const chatIdBigInt = safeBigInt(chat_id);
+    
     try {
-      entity = await client.getEntity(chat_id);
+      entity = await client.getEntity(chatIdBigInt || chat_id);
     } catch (e) {
       // Tentar com -100 prefix para canais/supergrupos
-      if (!String(chat_id).startsWith('-100')) {
+      const chIdStr = String(chat_id);
+      if (!chIdStr.startsWith('-100') && !chIdStr.startsWith('-')) {
         try {
-          entity = await client.getEntity(Number(`-100${Math.abs(chat_id)}`));
+          const prefixed = safeBigInt(`-100${chIdStr}`);
+          entity = await client.getEntity(prefixed);
         } catch {
           return res.status(404).json({ error: 'Chat não encontrado ou você não tem acesso', success: false });
         }
@@ -567,11 +724,10 @@ app.post('/get-chat-info', verifySecret, async (req, res) => {
     else if (entity.megagroup) chatType = 'supergroup';
     else if (entity.className === 'Chat') chatType = 'group';
 
+    // BIGINT-SAFE
     const chatInfo = {
-      chat_id: entity.id?.value ? Number(entity.id.value) : Number(entity.id),
-      access_hash: entity.accessHash?.value 
-        ? entity.accessHash.value.toString() 
-        : (entity.accessHash ? entity.accessHash.toString() : null),
+      chat_id: bigIntToString(getEntityId(entity)),
+      access_hash: bigIntToString(getEntityAccessHash(entity)),
       title: entity.title || entity.firstName || 'Sem título',
       username: entity.username || null,
       type: chatType,
@@ -656,6 +812,8 @@ app.post('/get-history', verifySecret, async (req, res) => {
       total_fetched: messagesAfterMin.length,
       filtered_count: filteredMessages.length,
       has_more: messages.length === Math.min(limit, 100),
+      _version: VERSION,
+      _deployed_at: DEPLOYED_AT,
     });
   } catch (error) {
     log('error', 'getHistory failed', { error: error.message });
@@ -684,9 +842,10 @@ app.post('/get-messages', verifySecret, async (req, res) => {
 
     const identifier = `${user_id}_${phone_number}`;
     const client = await getOrCreateClient(decryptedSession, identifier);
-    const peer = await resolvePeer(client, chat_id, access_hash);
 
+    const peer = await resolvePeer(client, chat_id, access_hash);
     const ids = message_ids.map((id) => Number(id)).filter((n) => Number.isFinite(n));
+
     const messages = await client.getMessages(peer, { ids });
 
     serverStats.successfulRequests++;
@@ -696,6 +855,8 @@ app.post('/get-messages', verifySecret, async (req, res) => {
       success: true,
       messages: (messages || []).map(serializeMessage),
       total: (messages || []).length,
+      _version: VERSION,
+      _deployed_at: DEPLOYED_AT,
     });
   } catch (error) {
     log('error', 'getMessages failed', { error: error.message });
@@ -742,12 +903,16 @@ app.post('/forward-messages', verifySecret, async (req, res) => {
     const fromPeer = await resolvePeer(client, from_chat_id, from_access_hash);
     const toPeer = await resolvePeer(client, to_chat_id, to_access_hash);
 
+    const ids = (Array.isArray(message_ids) ? message_ids : [])
+      .map((id) => Number(id))
+      .filter((n) => Number.isFinite(n));
+
     const result = await client.invoke(
       new Api.messages.ForwardMessages({
         fromPeer,
         toPeer,
-        id: message_ids,
-        randomId: message_ids.map(() => BigInt(Math.floor(Math.random() * 1e15))),
+        id: ids,
+        randomId: ids.map(() => BigInt(Math.floor(Math.random() * 1e15))),
         dropAuthor: drop_author,
       })
     );
@@ -769,9 +934,11 @@ app.post('/forward-messages', verifySecret, async (req, res) => {
 
     res.json({
       success: true,
-      forwarded: message_ids.length,
+      forwarded: ids.length,
       forwarded_ids: forwardedIds,
       updates_count: Array.isArray(result?.updates) ? result.updates.length : null,
+      _version: VERSION,
+      _deployed_at: DEPLOYED_AT,
     });
   } catch (error) {
     log('error', 'forwardMessages failed', { error: error.message });
@@ -779,19 +946,6 @@ app.post('/forward-messages', verifySecret, async (req, res) => {
     serverStats.lastError = { message: error.message, timestamp: new Date().toISOString() };
     res.status(500).json({ error: error.message, success: false });
   }
-});
-
-// Always return JSON for unknown routes (prevents HTML 404 pages breaking edge parsing)
-app.use((req, res) => {
-  res.status(404).json({ success: false, error: 'Not found' });
-});
-
-// Global error handler (prevents HTML error pages)
-app.use((err, req, res, next) => {
-  log('error', 'Unhandled server error', { error: err?.message || String(err) });
-  serverStats.failedRequests++;
-  serverStats.lastError = { message: err?.message || String(err), timestamp: new Date().toISOString() };
-  res.status(500).json({ success: false, error: err?.message || 'Internal error' });
 });
 
 // ==================== SEND MEDIA (Clone sem forward tag) ====================
@@ -824,14 +978,10 @@ app.post('/send-media', verifySecret, async (req, res) => {
     const client = await getOrCreateClient(decryptedSession, identifier);
 
     // Get original message
-    let fromPeer;
-    if (from_access_hash) {
-      fromPeer = new Api.InputPeerChannel({ channelId: BigInt(from_chat_id), accessHash: BigInt(from_access_hash) });
-    } else {
-      fromPeer = new Api.InputPeerChat({ chatId: BigInt(Math.abs(from_chat_id)) });
-    }
+    const fromPeer = await resolvePeer(client, from_chat_id, from_access_hash);
 
-    const messages = await client.getMessages(fromPeer, { ids: [message_id] });
+    const msgId = Number(message_id);
+    const messages = await client.getMessages(fromPeer, { ids: [msgId] });
     if (!messages.length || !messages[0].media) {
       return res.status(404).json({ error: 'Mensagem ou mídia não encontrada', success: false });
     }
@@ -839,12 +989,7 @@ app.post('/send-media', verifySecret, async (req, res) => {
     const originalMessage = messages[0];
 
     // Prepare destination
-    let toPeer;
-    if (to_access_hash) {
-      toPeer = new Api.InputPeerChannel({ channelId: BigInt(to_chat_id), accessHash: BigInt(to_access_hash) });
-    } else {
-      toPeer = new Api.InputPeerChat({ chatId: BigInt(Math.abs(to_chat_id)) });
-    }
+    const toPeer = await resolvePeer(client, to_chat_id, to_access_hash);
 
     // Send without forward tag
     const result = await client.sendMessage(toPeer, {
@@ -858,6 +1003,8 @@ app.post('/send-media', verifySecret, async (req, res) => {
     res.json({
       success: true,
       sent_message_id: result.id,
+      _version: VERSION,
+      _deployed_at: DEPLOYED_AT,
     });
   } catch (error) {
     log('error', 'sendMedia failed', { error: error.message });
@@ -888,32 +1035,43 @@ app.post('/get-chat-photo', verifySecret, async (req, res) => {
 
     // Get the entity
     let entity;
+    const chatIdBigInt = safeBigInt(chat_id);
+    const accessHashBigInt = safeBigInt(access_hash);
+    
     try {
-      if (access_hash) {
+      if (accessHashBigInt) {
+        const channelId = normalizePositiveId(chat_id);
+        if (!channelId) {
+          return res.json({ success: true, photo_base64: null, has_photo: false, _version: VERSION, _deployed_at: DEPLOYED_AT });
+        }
         entity = await client.getEntity(new Api.InputPeerChannel({
-          channelId: BigInt(chat_id),
-          accessHash: BigInt(access_hash),
+          channelId,
+          accessHash: accessHashBigInt,
         }));
+      } else if (chatIdBigInt) {
+        entity = await client.getEntity(chatIdBigInt);
       } else {
         entity = await client.getEntity(chat_id);
       }
     } catch (e) {
       // Try with -100 prefix
-      if (!String(chat_id).startsWith('-100')) {
+      const chIdStr = String(chat_id);
+      if (!chIdStr.startsWith('-100') && !chIdStr.startsWith('-')) {
         try {
-          entity = await client.getEntity(Number(`-100${Math.abs(chat_id)}`));
+          const prefixed = safeBigInt(`-100${chIdStr}`);
+          entity = await client.getEntity(prefixed);
         } catch {
-          return res.json({ success: true, photo_base64: null, has_photo: false });
+          return res.json({ success: true, photo_base64: null, has_photo: false, _version: VERSION, _deployed_at: DEPLOYED_AT });
         }
       } else {
-        return res.json({ success: true, photo_base64: null, has_photo: false });
+        return res.json({ success: true, photo_base64: null, has_photo: false, _version: VERSION, _deployed_at: DEPLOYED_AT });
       }
     }
 
     // Check if entity has a photo
     if (!entity.photo || entity.photo.className === 'ChatPhotoEmpty') {
       log('info', 'Chat has no photo', { chat_id });
-      return res.json({ success: true, photo_base64: null, has_photo: false });
+      return res.json({ success: true, photo_base64: null, has_photo: false, _version: VERSION, _deployed_at: DEPLOYED_AT });
     }
 
     // Download the photo
@@ -940,10 +1098,12 @@ app.post('/get-chat-photo', verifySecret, async (req, res) => {
         has_photo: true,
         size: photo.length,
         mime_type: 'image/jpeg',
+        _version: VERSION,
+        _deployed_at: DEPLOYED_AT,
       });
     } catch (downloadError) {
       log('warn', 'Failed to download photo', { chat_id, error: downloadError.message });
-      return res.json({ success: true, photo_base64: null, has_photo: false });
+      return res.json({ success: true, photo_base64: null, has_photo: false, _version: VERSION, _deployed_at: DEPLOYED_AT });
     }
   } catch (error) {
     log('error', 'getChatPhoto failed', { error: error.message });
@@ -976,11 +1136,13 @@ app.post('/logout', verifySecret, async (req, res) => {
     }
 
     const loginId = `${user_id}_${phone_number}`;
+
     if (clientPool.has(loginId)) {
       const { client } = clientPool.get(loginId);
       try { await client.disconnect(); } catch {}
       clientPool.delete(loginId);
     }
+
     if (pendingLogins.has(loginId)) {
       const { client } = pendingLogins.get(loginId);
       try { await client.disconnect(); } catch {}
@@ -989,18 +1151,31 @@ app.post('/logout', verifySecret, async (req, res) => {
 
     serverStats.successfulRequests++;
 
-    res.json({ success: true, message: 'Logged out' });
+    res.json({ success: true, message: 'Logged out', _version: VERSION, _deployed_at: DEPLOYED_AT });
   } catch (error) {
     log('error', 'logout failed', { error: error.message });
     res.status(500).json({ error: error.message, success: false });
   }
 });
 
+// Always return JSON for unknown routes (prevents HTML 404 pages breaking edge parsing)
+app.use((req, res) => {
+  res.status(404).json({ success: false, error: 'Not found', _version: VERSION, _deployed_at: DEPLOYED_AT });
+});
+
+// Global error handler (prevents HTML error pages)
+app.use((err, req, res, next) => {
+  log('error', 'Unhandled server error', { error: err?.message || String(err) });
+  serverStats.failedRequests++;
+  serverStats.lastError = { message: err?.message || String(err), timestamp: new Date().toISOString() };
+  res.status(500).json({ success: false, error: err?.message || 'Internal error', _version: VERSION, _deployed_at: DEPLOYED_AT });
+});
+
 // ==================== START SERVER ====================
 app.listen(PORT, () => {
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════╗
-║              MTProto Server v2.0 - ROBUST EDITION                 ║
+║              MTProto Server v2.2 - BigInt-SAFE EDITION            ║
 ╠═══════════════════════════════════════════════════════════════════╣
 ║  Status:   Running on port ${String(PORT).padEnd(5)}                              ║
 ║  API ID:   ${API_ID ? 'Configured ✓'.padEnd(15) : 'NOT SET ✗'.padEnd(15)}                              ║
