@@ -1,15 +1,18 @@
 /**
- * MTProto Server v2.2 - Servidor ROBUSTO para Telegram
+ * MTProto Server v2.4.0 - Servidor ROBUSTO para Telegram
  * 
- * Melhorias:
+ * Changelog:
+ * v2.4.0 - Correção de compatibilidade XOR + Session Candidates robustos
+ * v2.3.0 - Migração de AES para XOR encryption
+ * v2.2.0 - BigInt-safe serialization + canonicalização
+ * 
+ * Features:
  * - Reconexão automática
  * - Health checks completos
  * - Melhor tratamento de erros
  * - Pool de conexões
  * - Logs detalhados
- * - BigInt-safe serialization + canonicalização (v2.2)
- * - Version stamping nas respostas (v2.2)
- * - FIX: ordem correta dos middlewares (404/error handler) (v2.2)
+ * - Session candidates (tenta múltiplos formatos)
  * 
  * Deploy em: Railway, Render, Fly.io, ou VPS
  */
@@ -32,7 +35,7 @@ const SERVER_SECRET = process.env.MTPROTO_SERVER_SECRET || 'change-me-in-product
 const PORT = process.env.PORT || 3000;
 
 // ==================== VERSIONING ====================
-const VERSION = '2.3.0'; // Fixed session encryption compatibility with Edge Functions
+const VERSION = '2.4.0'; // Session candidates + XOR compatibility fix
 const DEPLOYED_AT = new Date().toISOString();
 
 // ==================== STATE MANAGEMENT ====================
