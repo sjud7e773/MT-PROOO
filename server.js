@@ -32,7 +32,7 @@ const SERVER_SECRET = process.env.MTPROTO_SERVER_SECRET || 'change-me-in-product
 const PORT = process.env.PORT || 3000;
 
 // ==================== VERSIONING ====================
-const VERSION = '2.2.0';
+const VERSION = '2.3.0'; // Fixed session encryption compatibility with Edge Functions
 const DEPLOYED_AT = new Date().toISOString();
 
 // ==================== STATE MANAGEMENT ====================
@@ -53,24 +53,69 @@ const serverStats = {
 };
 
 // ==================== HELPERS ====================
+/**
+ * XOR-based encryption compatible with Edge Functions.
+ * Uses simple XOR + base64 (same as Supabase Edge Functions).
+ */
 function encrypt(text, key) {
-  const cipher = crypto.createCipheriv('aes-256-cbc', 
-    crypto.createHash('sha256').update(key).digest(), 
-    Buffer.alloc(16, 0)
-  );
-  return cipher.update(text, 'utf8', 'base64') + cipher.final('base64');
+  if (!key || !text) return text;
+  let result = '';
+  for (let i = 0; i < text.length; i++) {
+    result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+  }
+  return Buffer.from(result, 'binary').toString('base64');
 }
 
+/**
+ * XOR-based decryption compatible with Edge Functions.
+ * Decodes base64 then applies XOR with key.
+ */
 function decrypt(encrypted, key) {
+  if (!key || !encrypted) return encrypted;
   try {
-    const decipher = crypto.createDecipheriv('aes-256-cbc',
-      crypto.createHash('sha256').update(key).digest(),
-      Buffer.alloc(16, 0)
-    );
-    return decipher.update(encrypted, 'base64', 'utf8') + decipher.final('utf8');
+    // First try base64 decode (XOR format from Edge Functions)
+    const decoded = Buffer.from(encrypted, 'base64').toString('binary');
+    let result = '';
+    for (let i = 0; i < decoded.length; i++) {
+      result += String.fromCharCode(decoded.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+    }
+    
+    // Verify it looks like a valid session string (gramjs sessions are base64-ish)
+    if (result && result.length > 20 && /^[A-Za-z0-9+/=]+$/.test(result.trim().substring(0, 50))) {
+      return result;
+    }
+    
+    // If the result doesn't look like a session, maybe it was already decrypted
+    // or stored in a different format - return the original
+    return encrypted;
   } catch {
-    return null;
+    // If base64 decode fails, it might already be a raw session
+    return encrypted;
   }
+}
+
+/**
+ * Try multiple decryption strategies for compatibility with different storage formats.
+ */
+function getSessionCandidates(encrypted) {
+  if (!encrypted) return [];
+  const raw = String(encrypted).trim();
+  if (!raw) return [];
+  
+  const candidates = [];
+  
+  // 1. Try XOR decryption
+  const decrypted = decrypt(raw, SERVER_SECRET);
+  if (decrypted && decrypted !== raw) {
+    candidates.push(decrypted);
+  }
+  
+  // 2. Try raw (maybe already a valid session string)
+  if (!candidates.includes(raw)) {
+    candidates.push(raw);
+  }
+  
+  return candidates;
 }
 
 function log(level, message, data = {}) {
@@ -428,6 +473,42 @@ async function getOrCreateClient(sessionString, identifier) {
   return client;
 }
 
+/**
+ * Try to get a working client from multiple session candidates.
+ * This handles compatibility between different storage formats.
+ */
+async function getClientWithSession(encryptedSession, identifier) {
+  const candidates = getSessionCandidates(encryptedSession);
+  
+  if (candidates.length === 0) {
+    throw new Error('No valid session candidates found');
+  }
+  
+  let lastError = null;
+  
+  for (const sessionStr of candidates) {
+    try {
+      const client = await getOrCreateClient(sessionStr, `${identifier}_${sessionStr.substring(0, 10)}`);
+      
+      // Quick validation - try to get "me" user
+      try {
+        await client.getMe();
+        return client;
+      } catch (meErr) {
+        // Session might be invalid, try next candidate
+        log('debug', 'Session validation failed', { error: meErr.message });
+        lastError = meErr;
+        continue;
+      }
+    } catch (err) {
+      lastError = err;
+      log('debug', 'Failed to create client with session candidate', { error: err.message });
+    }
+  }
+  
+  throw lastError || new Error('All session candidates failed');
+}
+
 // ==================== SEND CODE ====================
 app.post('/send-code', verifySecret, async (req, res) => {
   try {
@@ -608,15 +689,10 @@ app.post('/get-dialogs', verifySecret, async (req, res) => {
       return res.status(400).json({ error: 'session_string is required', success: false });
     }
 
-    const decryptedSession = decrypt(session_string, SERVER_SECRET);
-    if (!decryptedSession) {
-      return res.status(400).json({ error: 'Invalid session', success: false });
-    }
-
     log('info', 'Fetching dialogs');
 
     const identifier = `${user_id}_${phone_number}`;
-    const client = await getOrCreateClient(decryptedSession, identifier);
+    const client = await getClientWithSession(session_string, identifier);
 
     const dialogs = await client.getDialogs({ limit: 300 });
     log('info', 'Got dialogs', { count: dialogs.length });
@@ -688,15 +764,10 @@ app.post('/get-chat-info', verifySecret, async (req, res) => {
       return res.status(400).json({ error: 'session_string and chat_id are required', success: false });
     }
 
-    const decryptedSession = decrypt(session_string, SERVER_SECRET);
-    if (!decryptedSession) {
-      return res.status(400).json({ error: 'Invalid session', success: false });
-    }
-
     log('info', 'Getting chat info', { chat_id });
 
     const identifier = `${user_id}_${phone_number}`;
-    const client = await getOrCreateClient(decryptedSession, identifier);
+    const client = await getClientWithSession(session_string, identifier);
 
     // Buscar entidade pelo ID
     let entity;
@@ -760,15 +831,10 @@ app.post('/get-history', verifySecret, async (req, res) => {
       return res.status(400).json({ error: 'session_string and chat_id are required', success: false });
     }
 
-    const decryptedSession = decrypt(session_string, SERVER_SECRET);
-    if (!decryptedSession) {
-      return res.status(400).json({ error: 'Invalid session', success: false });
-    }
-
     log('info', 'Fetching history', { chat_id, limit, offset_id, media_filter });
 
     const identifier = `${user_id}_${phone_number}`;
-    const client = await getOrCreateClient(decryptedSession, identifier);
+    const client = await getClientWithSession(session_string, identifier);
 
     const peer = await resolvePeer(client, chat_id, access_hash);
     const messages = await client.getMessages(peer, { limit: Math.min(limit, 100), offsetId: offset_id });
@@ -833,15 +899,10 @@ app.post('/get-messages', verifySecret, async (req, res) => {
       return res.status(400).json({ error: 'session_string, chat_id and message_ids are required', success: false });
     }
 
-    const decryptedSession = decrypt(session_string, SERVER_SECRET);
-    if (!decryptedSession) {
-      return res.status(400).json({ error: 'Invalid session', success: false });
-    }
-
     log('info', 'Fetching messages by ids', { chat_id, count: message_ids.length });
 
     const identifier = `${user_id}_${phone_number}`;
-    const client = await getOrCreateClient(decryptedSession, identifier);
+    const client = await getClientWithSession(session_string, identifier);
 
     const peer = await resolvePeer(client, chat_id, access_hash);
     const ids = message_ids.map((id) => Number(id)).filter((n) => Number.isFinite(n));
@@ -885,11 +946,6 @@ app.post('/forward-messages', verifySecret, async (req, res) => {
       return res.status(400).json({ error: 'Missing required parameters', success: false });
     }
 
-    const decryptedSession = decrypt(session_string, SERVER_SECRET);
-    if (!decryptedSession) {
-      return res.status(400).json({ error: 'Invalid session', success: false });
-    }
-
     log('info', 'Forwarding messages', { 
       from: from_chat_id, 
       to: to_chat_id, 
@@ -897,7 +953,7 @@ app.post('/forward-messages', verifySecret, async (req, res) => {
     });
 
     const identifier = `${user_id}_${phone_number}`;
-    const client = await getOrCreateClient(decryptedSession, identifier);
+    const client = await getClientWithSession(session_string, identifier);
 
     // Resolve peers robustly (works even if access_hash is missing/wrong)
     const fromPeer = await resolvePeer(client, from_chat_id, from_access_hash);
@@ -967,15 +1023,10 @@ app.post('/send-media', verifySecret, async (req, res) => {
       return res.status(400).json({ error: 'Missing required parameters', success: false });
     }
 
-    const decryptedSession = decrypt(session_string, SERVER_SECRET);
-    if (!decryptedSession) {
-      return res.status(400).json({ error: 'Invalid session', success: false });
-    }
-
     log('info', 'Sending media', { from: from_chat_id, to: to_chat_id, message_id });
 
     const identifier = `${user_id}_${phone_number}`;
-    const client = await getOrCreateClient(decryptedSession, identifier);
+    const client = await getClientWithSession(session_string, identifier);
 
     // Get original message
     const fromPeer = await resolvePeer(client, from_chat_id, from_access_hash);
@@ -1023,15 +1074,10 @@ app.post('/get-chat-photo', verifySecret, async (req, res) => {
       return res.status(400).json({ error: 'session_string and chat_id are required', success: false });
     }
 
-    const decryptedSession = decrypt(session_string, SERVER_SECRET);
-    if (!decryptedSession) {
-      return res.status(400).json({ error: 'Invalid session', success: false });
-    }
-
     log('info', 'Fetching chat photo', { chat_id });
 
     const identifier = `${user_id}_${phone_number}`;
-    const client = await getOrCreateClient(decryptedSession, identifier);
+    const client = await getClientWithSession(session_string, identifier);
 
     // Get the entity
     let entity;
@@ -1118,19 +1164,21 @@ app.post('/logout', verifySecret, async (req, res) => {
   try {
     const { session_string, user_id, phone_number } = req.body;
     
+    // Try to logout using session candidates
     if (session_string) {
-      const decryptedSession = decrypt(session_string, SERVER_SECRET);
-      if (decryptedSession) {
+      const candidates = getSessionCandidates(session_string);
+      for (const sessionStr of candidates) {
         try {
-          const stringSession = new StringSession(decryptedSession);
+          const stringSession = new StringSession(sessionStr);
           const client = new TelegramClient(stringSession, API_ID, API_HASH, {
             connectionRetries: 1,
           });
           await client.connect();
           await client.invoke(new Api.auth.LogOut());
           await client.disconnect();
+          break; // Success, stop trying
         } catch (e) {
-          log('warn', 'Logout from Telegram failed', { error: e.message });
+          log('debug', 'Logout attempt failed', { error: e.message });
         }
       }
     }
